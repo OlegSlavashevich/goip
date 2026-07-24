@@ -16,6 +16,17 @@ export function loadConfig(env = process.env) {
     geminiModel: env.GEMINI_MODEL || '',
     systemInstruction: env.SYSTEM_INSTRUCTION || '',
     initialText: env.INITIAL_TEXT || '',
+    botProfile: env.BOT_PROFILE || 'real-estate',
+    botPageUrl: env.BOT_PAGE_URL || 'https://kakdoma-sutochno.ru/assist/',
+    botDateUtcOffset: env.BOT_DATE_UTC_OFFSET || '+03:00',
+    botVoiceName: env.BOT_VOICE_NAME || 'Erinome',
+    allowConfirmBooking: boolean(env.ALLOW_CONFIRM_BOOKING, false),
+    botMaxCallDurationMs: integer(
+      env.BOT_MAX_CALL_DURATION_MS,
+      1_200_000,
+      'BOT_MAX_CALL_DURATION_MS',
+      0,
+    ),
     maxPendingAudioBytes: integer(
       env.MAX_PENDING_AUDIO_BYTES,
       1_048_576,
@@ -31,6 +42,9 @@ export function loadConfig(env = process.env) {
   };
 
   if (mode === 'proxy') {
+    if (!['simple', 'real-estate'].includes(config.botProfile)) {
+      throw new Error('BOT_PROFILE must be "simple" or "real-estate"');
+    }
     for (const [name, value] of [
       ['PROXY_WS_URL', config.proxyWsUrl],
       ['PROXY_SHARED_TOKEN', config.proxySharedToken],
@@ -61,4 +75,3 @@ function boolean(raw, fallback) {
   if (['false', '0', 'no', 'off'].includes(raw.toLowerCase())) return false;
   throw new Error(`Invalid boolean value: ${raw}`);
 }
-

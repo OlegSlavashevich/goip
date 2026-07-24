@@ -8,6 +8,7 @@ import {
   encodeAudioSocketFrame,
   uuidBytesToString,
 } from './audio-socket.js';
+import { createRealEstateBot } from './real-estate-bot.js';
 import { WavRecorder } from './wav.js';
 
 const config = loadConfig();
@@ -51,6 +52,10 @@ class CallSession {
     this.recorder = undefined;
     this.ws = undefined;
     this.wsReady = false;
+    this.proxySetup = undefined;
+    this.bot = undefined;
+    this.botClient = undefined;
+    this.botStarted = false;
     this.closed = false;
     this.sequenceNumber = 0;
     this.mediaChunk = 1;
@@ -106,7 +111,12 @@ class CallSession {
         );
         this.maxDurationTimer.unref();
       }
-      if (this.config.mode === 'proxy') this.connectProxy();
+      if (this.config.mode === 'proxy') {
+        this.prepareProxy().catch((error) => {
+          log('error', 'Failed to prepare AI session', this.fields({ error: error.message }));
+          this.close('bot_setup_error');
+        });
+      }
       return;
     }
 
@@ -132,6 +142,32 @@ class CallSession {
     log('debug', 'Ignoring AudioSocket frame', this.fields({ kind, bytes: payload.length }));
   }
 
+  async prepareProxy() {
+    if (this.config.botProfile === 'real-estate') {
+      this.bot = createRealEstateBot({
+        geminiModel: this.config.geminiModel,
+        voiceName: this.config.botVoiceName,
+        pageUrl: this.config.botPageUrl,
+        dateUtcOffset: this.config.botDateUtcOffset,
+        allowConfirmBooking: this.config.allowConfirmBooking,
+        maxCallDurationMs: this.config.botMaxCallDurationMs,
+        log: (level, message, fields) => log(level, message, this.fields(fields)),
+      });
+      this.proxySetup = await this.bot.initialize();
+    } else {
+      this.proxySetup = {
+        model: this.config.geminiModel,
+        config: {
+          responseModalities: ['AUDIO'],
+          systemInstruction: this.config.systemInstruction
+            ? { parts: [{ text: this.config.systemInstruction }] }
+            : undefined,
+        },
+      };
+    }
+    if (!this.closed) this.connectProxy();
+  }
+
   connectProxy() {
     const ws = new WebSocket(this.config.proxyWsUrl, {
       headers: { Authorization: `Bearer ${this.config.proxySharedToken}` },
@@ -143,16 +179,15 @@ class CallSession {
     ws.on('open', () => {
       if (this.closed) return ws.close();
       this.wsReady = true;
+      this.botClient = this.bot?.createClient(
+        (packet) => this.sendProxyPacket(packet),
+        () => this.clearPlayback(),
+      );
       this.sendProxyPacket({
         customEvent: 'gemini',
         setup: {
-          model: this.config.geminiModel,
-          config: {
-            responseModalities: ['AUDIO'],
-            systemInstruction: this.config.systemInstruction
-              ? { parts: [{ text: this.config.systemInstruction }] }
-              : undefined,
-          },
+          model: this.proxySetup.model,
+          config: this.proxySetup.config,
         },
         metadata: { callId: this.callId, source: 'goip-audiosocket-bridge' },
       });
@@ -229,11 +264,19 @@ class CallSession {
       log('info', 'Proxy session closed', this.fields({ proxyClosed: packet.proxyClosed }));
       return;
     }
-    if (packet.serverMessage?.setupComplete && this.config.initialText) {
+    const serverMessage = packet.serverMessage || {};
+    this.bot?.handleServerMessage(serverMessage, this.botClient);
+
+    const initialText = this.bot?.initialText || this.config.initialText;
+    if (serverMessage.setupComplete && initialText) {
       this.sendProxyPacket({
         customEvent: 'gemini',
-        realtimeInput: { text: this.config.initialText },
+        realtimeInput: { text: initialText },
       });
+      if (this.bot && !this.botStarted) {
+        this.botStarted = true;
+        this.bot.startWatchdogs(this.botClient, (reason) => this.close(reason));
+      }
       log('info', 'Gemini session ready', this.fields());
     }
   }
@@ -279,6 +322,13 @@ class CallSession {
     }
   }
 
+  clearPlayback() {
+    this.playbackQueue = [];
+    this.playbackBytes = 0;
+    if (this.playbackTimer) clearInterval(this.playbackTimer);
+    this.playbackTimer = undefined;
+  }
+
   flushPlaybackFrame() {
     if (this.closed || this.socket.destroyed) return;
     const frame = this.playbackQueue.shift();
@@ -296,6 +346,7 @@ class CallSession {
     this.closed = true;
     if (this.maxDurationTimer) clearTimeout(this.maxDurationTimer);
     if (this.playbackTimer) clearInterval(this.playbackTimer);
+    this.bot?.shutdown(reason);
 
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({

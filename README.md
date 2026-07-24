@@ -160,8 +160,12 @@ CALL_MAX_SECONDS=0
 PROXY_WS_URL=wss://gemini-proxy.inoperate.com/v1/live
 PROXY_SHARED_TOKEN=<тот же PROXY_SHARED_TOKEN, что на ai-websocket-proxy>
 GEMINI_MODEL=gemini-2.5-flash-native-audio-preview-12-2025
-SYSTEM_INSTRUCTION=Ты голосовой помощник. Отвечай кратко и естественно на русском языке.
-INITIAL_TEXT=Начни разговор коротким приветствием на русском языке.
+BOT_PROFILE=real-estate
+BOT_PAGE_URL=https://kakdoma-sutochno.ru/assist/
+BOT_DATE_UTC_OFFSET=+03:00
+BOT_VOICE_NAME=Erinome
+BOT_MAX_CALL_DURATION_MS=1200000
+ALLOW_CONFIRM_BOOKING=false
 ```
 
 `CALL_MAX_SECONDS=0` отключает тестовый автоотбой. Для ограниченного
@@ -209,18 +213,77 @@ Node.js bridge подключается к `/v1/live` с `Authorization: Bearer 
 Обратные `media`-пакеты декодируются, преобразуются в 8 kHz PCM и
 возвращаются через Asterisk в RTP/GoIP. При отбое отправляется `stop`.
 
-### Важная граница ответственности
+### Перенесённый сценарий «Как Дома»
 
-`ai-websocket-proxy` из соседнего проекта является транспортным адаптером.
-Раньше модель, system prompt, tools и выполнение tool calls находились в
-сценарии Voximplant. Текущая первая версия Node.js bridge передаёт модель,
-простой system prompt и начальную реплику, поэтому голосовой диалог работает
-без изменения proxy.
+При `BOT_PROFILE=real-estate` bridge запускает для каждого звонка отдельный
+экземпляр сценария из `examples/scenario_proxy.js`: полный system prompt,
+транскрипты, метрики и инструменты `search_apartments`,
+`check_apartment_availability`, `get_apartment_detail` и
+`create_booking_request`. `ai-websocket-proxy` остаётся без изменений и
+используется только как транспорт к Gemini Live.
 
-Чтобы полностью повторить существующего бизнес-бота, его prompt, объявления
-tools и обработчики tool calls нужно следующим шагом перенести из сценария
-Voximplant в Node.js bridge. Сам media-протокол и `ai-websocket-proxy` при
-этом менять не требуется.
+По умолчанию `ALLOW_CONFIRM_BOOKING=false`: диалог и заявка проходят в
+dry-run, реальный `/confirm` не вызывается. Включайте `true` только после
+проверки логов, данных брони и правовых оснований.
+
+Логи разговора и инструментов:
+
+```bash
+journalctl -u goip-ai-bridge -f
+```
+
+Обновление нативной установки:
+
+```bash
+cd /opt/goip-ai-bridge
+git pull --ff-only
+nano /etc/goip-ai-bridge.env
+sh deploy/native/install.sh /opt/goip-ai-bridge
+journalctl -u goip-ai-bridge -f
+```
+
+После изменения исходного Voximplant-сценария синхронизировать перенос можно
+командой (из этого репозитория, когда соседний проект доступен локально):
+
+```bash
+node scripts/import-real-estate-scenario.mjs
+```
+
+### Персональные данные и трансграничная передача
+
+WSS шифрует канал, но не отменяет факт трансграничной передачи. В этой схеме
+за пределы Беларуси могут уходить голос, расшифровка, номер телефона, имя,
+даты и данные заявки. До продакшена определите страны размещения
+`ai-websocket-proxy` и AI-провайдера, правовое основание передачи, текст
+информирования/согласия, сроки хранения и удаления, а также договоры с
+обработчиками.
+
+Если основанием является согласие, его нужно получить до отправки первого
+аудиокадра за границу. Одного приветствия, которое уже генерирует внешний AI,
+для этого недостаточно: нужен локальный IVR/запись перед `AudioSocket` либо
+другое подтверждённое юристом основание. Тестовые WAV и подробные транскрипты
+в продакшене лучше отключить (`RECORD_CALLS=false`) или хранить строго
+ограниченный срок.
+
+Для юридической проверки:
+
+- [Закон Республики Беларусь № 99-З — перевод на сайте НЦЗПД](https://cpd.by/en/national-regulation/the-belarusian-data-protection-act/)
+- [Официальный список доступных регионов Gemini API](https://ai.google.dev/gemini-api/docs/available-regions)
+- [Условия обработки данных Gemini API](https://ai.google.dev/gemini-api/terms)
+- [Zero data retention в Gemini Developer API](https://ai.google.dev/gemini-api/docs/zdr)
+
+На момент последней проверки Беларусь отсутствует в опубликованном Google
+списке доступных регионов Gemini Developer API. Это не исправляется
+размещением proxy в другой стране: перед продакшеном нужен продукт/договор
+провайдера, который прямо допускает обслуживание пользователей из Беларуси.
+
+Отдельно проверьте регулирование электросвязи: Закон Республики Беларусь
+№ 45-З определяет международный трафик широко, включая сетевые пакеты
+независимо от протокола. Поэтому замена внешнего SIP на внешний WSS сама по
+себе не доказывает соответствие требованиям. Для коммерческого запуска
+получите письменное заключение белорусского специалиста по электросвязи либо
+разъяснение регулятора именно для схемы GSM → локальный Asterisk → внешний
+AI-процессинг.
 
 ## Сеть и безопасность
 
