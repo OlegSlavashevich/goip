@@ -13,6 +13,8 @@ test('real-estate bot is the safe default in proxy mode', () => {
   assert.equal(config.botProfile, 'real-estate');
   assert.equal(config.allowConfirmBooking, false);
   assert.equal(config.botPageUrl, 'https://kakdoma-sutochno.ru/assist/');
+  assert.equal(config.latencyMonitoring, true);
+  assert.equal(config.proxyPingIntervalMs, 5_000);
 });
 
 test('live booking must be explicitly enabled', () => {

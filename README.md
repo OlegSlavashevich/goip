@@ -254,6 +254,46 @@ Asterisk выполняет `Answer()` и подключает AudioSocket. На
 journalctl -u goip-ai-bridge -f
 ```
 
+### Диагностика задержек
+
+При `LATENCY_MONITORING=true` bridge измеряет WebSocket ping/pong до
+`ai-websocket-proxy`, равномерность входных AudioSocket-кадров и локальную
+очередь звука бота перед Asterisk. Интервал измерения RTT задаётся
+`PROXY_PING_INTERVAL_MS` (по умолчанию 5000 мс).
+
+На белорусской виртуалке:
+
+```bash
+journalctl -u goip-ai-bridge -f -o cat \
+  | grep --line-buffered -E \
+  'Proxy WebSocket RTT|Bot audio arrived|Bot audio sent|Bot audio playback summary|Call latency summary'
+```
+
+На сервере `ai-websocket-proxy`:
+
+```bash
+journalctl -u ai-websocket-proxy -f -o cat \
+  | grep --line-buffered -E \
+  'manual vad activity ended|gemini first audio|turn complete'
+```
+
+События связываются по `callId`/`metadata.callId` и номеру `turn`.
+
+- `silence_wall_ms` — сколько Silero ждал тишину после последнего голоса;
+- интервал между `manual vad activity ended` и `gemini first audio` — обработка
+  Gemini вместе с его исходящим CONNECT-маршрутом;
+- `gemini_audio_to_vox_media_ms` — ресемплинг и упаковка внутри proxy;
+- `proxyRttMs / 2` — приблизительная задержка одного направления между
+  Беларусью и proxy;
+- `proxyMediaToAudioSocketMs` — локальная очередь между получением звука и
+  первой отправкой в Asterisk;
+- `audioSocketInputGapsOver40Ms` — провалы входного медиапотока со стороны
+  Asterisk/GoIP.
+
+Последний участок `Asterisk → RTP → GoIP → динамик телефона` программно
+напрямую не наблюдается. Если все перечисленные интервалы низкие, но человек
+слышит поздний ответ, проверять нужно RTP/jitter buffer и сеть GoIP.
+
 Записи нативной установки:
 
 ```bash

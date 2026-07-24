@@ -47,6 +47,13 @@ export function loadConfig(env = process.env) {
       'MAX_PLAYBACK_AUDIO_BYTES',
       320,
     ),
+    latencyMonitoring: boolean(env.LATENCY_MONITORING, true),
+    proxyPingIntervalMs: integer(
+      env.PROXY_PING_INTERVAL_MS,
+      5_000,
+      'PROXY_PING_INTERVAL_MS',
+      1_000,
+    ),
   };
 
   if (mode === 'proxy') {

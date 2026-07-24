@@ -10,6 +10,7 @@ import {
   encodeAudioSocketFrame,
   uuidBytesToString,
 } from './audio-socket.js';
+import { summarizeLatency } from './latency.js';
 import { createRealEstateBot } from './real-estate-bot.js';
 import { WavRecorder } from './wav.js';
 
@@ -69,6 +70,7 @@ server.listen(config.port, config.host, () => {
     mode: config.mode,
     callMaxSeconds: config.callMaxSeconds,
     recordCalls: config.recordCalls,
+    latencyMonitoring: config.latencyMonitoring,
   });
 });
 
@@ -107,6 +109,16 @@ class CallSession {
     this.playbackBytes = 0;
     this.playbackTimer = undefined;
     this.maxDurationTimer = undefined;
+    this.proxyPingTimer = undefined;
+    this.proxyPingStartedAt = undefined;
+    this.proxyPingTimeouts = 0;
+    this.proxyRttSamples = [];
+    this.latestProxyRttMs = undefined;
+    this.lastInputFrameAt = undefined;
+    this.inputFrameGaps = [];
+    this.inputFrameGapsOver40Ms = 0;
+    this.playbackResponseIndex = 0;
+    this.activePlayback = undefined;
     this.resolveDone = undefined;
     this.done = new Promise((resolve) => {
       this.resolveDone = resolve;
@@ -162,6 +174,7 @@ class CallSession {
 
     if (kind === AUDIO_SOCKET_KIND.PCM16_8K) {
       if (!this.callId) return this.close('audio_before_uuid');
+      this.trackAudioSocketInputFrame();
       const pcm16k = upsample8kTo16k(payload);
       this.inputAudioDurationMs += pcmDurationMs(pcm16k, 16_000);
       this.recorder?.append(pcm16k);
@@ -214,7 +227,7 @@ class CallSession {
       this.wsReady = true;
       this.botClient = this.bot?.createClient(
         (packet) => this.sendProxyPacket(packet),
-        () => this.clearPlayback(),
+        () => this.clearPlayback('interrupted'),
       );
       this.sendProxyPacket({
         customEvent: 'gemini',
@@ -235,8 +248,10 @@ class CallSession {
         },
       });
       log('info', 'Proxy WebSocket connected', this.fields());
+      this.startProxyLatencyMonitoring();
     });
 
+    ws.on('pong', () => this.onProxyPong());
     ws.on('message', (data, isBinary) => {
       if (isBinary) {
         log('warn', 'Ignoring unexpected binary proxy message', this.fields());
@@ -272,8 +287,9 @@ class CallSession {
 
     if (packet.event === 'media' && typeof packet.media?.payload === 'string') {
       try {
+        const receivedAt = Date.now();
         const pcm16k = Buffer.from(packet.media.payload, 'base64');
-        this.queuePlayback(downsample16kTo8k(pcm16k));
+        this.queuePlayback(downsample16kTo8k(pcm16k), receivedAt);
       } catch (error) {
         log('warn', 'Invalid proxy media packet', this.fields({ error: error.message }));
         this.close('invalid_proxy_media');
@@ -296,6 +312,9 @@ class CallSession {
       return;
     }
     const serverMessage = packet.serverMessage || {};
+    if (serverMessage.serverContent?.turnComplete) {
+      this.markPlaybackTurnComplete();
+    }
     this.bot?.handleServerMessage(serverMessage, this.botClient);
 
     const initialText = this.bot?.initialText || this.config.initialText;
@@ -356,23 +375,50 @@ class CallSession {
     return true;
   }
 
-  queuePlayback(pcm8k) {
+  queuePlayback(pcm8k, receivedAt = Date.now()) {
     if (this.playbackBytes + pcm8k.length > this.config.maxPlaybackAudioBytes) {
       return this.close('playback_audio_overflow');
     }
+    if (!this.activePlayback) {
+      this.activePlayback = {
+        response: ++this.playbackResponseIndex,
+        firstProxyMediaAt: receivedAt,
+        firstAudioSocketWriteAt: undefined,
+        turnCompleteAt: undefined,
+        framesReceived: 0,
+        framesWritten: 0,
+        bytesReceived: 0,
+        bytesWritten: 0,
+        queuePeakBytes: 0,
+        audioSocketWritablePeakBytes: 0,
+      };
+      log('info', 'Bot audio arrived from proxy', this.fields({
+        response: this.activePlayback.response,
+        proxyRttMs: this.latestProxyRttMs,
+        estimatedProxyOneWayMs: estimateOneWay(this.latestProxyRttMs),
+      }));
+    }
     this.playbackQueue.push(pcm8k);
     this.playbackBytes += pcm8k.length;
+    this.activePlayback.framesReceived += 1;
+    this.activePlayback.bytesReceived += pcm8k.length;
+    this.activePlayback.queuePeakBytes = Math.max(
+      this.activePlayback.queuePeakBytes,
+      this.playbackBytes,
+    );
     if (!this.playbackTimer) {
       this.playbackTimer = setInterval(() => this.flushPlaybackFrame(), 20);
       this.playbackTimer.unref();
     }
   }
 
-  clearPlayback() {
+  clearPlayback(reason = 'cleared') {
+    const droppedBytes = this.playbackBytes;
     this.playbackQueue = [];
     this.playbackBytes = 0;
     if (this.playbackTimer) clearInterval(this.playbackTimer);
     this.playbackTimer = undefined;
+    this.finishPlayback(reason, { droppedAudioMs: audioBytesDurationMs(droppedBytes, 8_000) });
   }
 
   flushPlaybackFrame() {
@@ -381,10 +427,39 @@ class CallSession {
     if (!frame) {
       clearInterval(this.playbackTimer);
       this.playbackTimer = undefined;
+      if (this.activePlayback?.turnCompleteAt) this.finishPlayback('turn_complete');
       return;
     }
     this.playbackBytes -= frame.length;
-    this.socket.write(encodeAudioSocketFrame(AUDIO_SOCKET_KIND.PCM16_8K, frame));
+    const now = Date.now();
+    const playback = this.activePlayback;
+    if (playback && !playback.firstAudioSocketWriteAt) {
+      playback.firstAudioSocketWriteAt = now;
+      log('info', 'Bot audio sent to AudioSocket', this.fields({
+        response: playback.response,
+        proxyMediaToAudioSocketMs: now - playback.firstProxyMediaAt,
+        queuedAudioMs: audioBytesDurationMs(this.playbackBytes + frame.length, 8_000),
+        proxyRttMs: this.latestProxyRttMs,
+        estimatedProxyOneWayMs: estimateOneWay(this.latestProxyRttMs),
+      }));
+    }
+    const accepted = this.socket.write(
+      encodeAudioSocketFrame(AUDIO_SOCKET_KIND.PCM16_8K, frame),
+    );
+    if (playback) {
+      playback.framesWritten += 1;
+      playback.bytesWritten += frame.length;
+      playback.audioSocketWritablePeakBytes = Math.max(
+        playback.audioSocketWritablePeakBytes,
+        this.socket.writableLength,
+      );
+    }
+    if (!accepted) {
+      log('warn', 'AudioSocket write backpressure', this.fields({
+        response: playback?.response,
+        writableBytes: this.socket.writableLength,
+      }));
+    }
   }
 
   close(reason) {
@@ -392,6 +467,10 @@ class CallSession {
     this.closed = true;
     if (this.maxDurationTimer) clearTimeout(this.maxDurationTimer);
     if (this.playbackTimer) clearInterval(this.playbackTimer);
+    if (this.proxyPingTimer) clearInterval(this.proxyPingTimer);
+    this.finishPlayback('call_closed', {
+      droppedAudioMs: audioBytesDurationMs(this.playbackBytes, 8_000),
+    });
     this.bot?.shutdown(reason);
 
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -423,8 +502,95 @@ class CallSession {
       })
       : Promise.resolve();
 
+    log('info', 'Call latency summary', this.fields({
+      proxyWebSocketRtt: summarizeLatency(this.proxyRttSamples),
+      proxyPingTimeouts: this.proxyPingTimeouts,
+      audioSocketInputFrameGap: summarizeLatency(this.inputFrameGaps),
+      audioSocketInputGapsOver40Ms: this.inputFrameGapsOver40Ms,
+    }));
     log('info', 'Call finished', this.fields({ reason, audioDurationMs: durationMs }));
     recorderPromise.finally(() => this.resolveDone());
+  }
+
+  startProxyLatencyMonitoring() {
+    if (!this.config.latencyMonitoring || this.proxyPingTimer || !this.wsReady) return;
+    this.sendProxyPing();
+    this.proxyPingTimer = setInterval(
+      () => this.sendProxyPing(),
+      this.config.proxyPingIntervalMs,
+    );
+    this.proxyPingTimer.unref();
+  }
+
+  sendProxyPing() {
+    if (!this.wsReady || this.ws?.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (this.proxyPingStartedAt !== undefined) {
+      if (now - this.proxyPingStartedAt < this.config.proxyPingIntervalMs * 2) return;
+      this.proxyPingTimeouts += 1;
+      log('warn', 'Proxy WebSocket ping timed out', this.fields({
+        timeoutMs: now - this.proxyPingStartedAt,
+      }));
+    }
+    this.proxyPingStartedAt = now;
+    try {
+      this.ws.ping();
+    } catch (error) {
+      this.proxyPingStartedAt = undefined;
+      log('warn', 'Failed to ping proxy WebSocket', this.fields({ error: error.message }));
+    }
+  }
+
+  onProxyPong() {
+    if (this.proxyPingStartedAt === undefined) return;
+    const rttMs = Date.now() - this.proxyPingStartedAt;
+    this.proxyPingStartedAt = undefined;
+    this.latestProxyRttMs = rttMs;
+    this.proxyRttSamples.push(rttMs);
+    log('info', 'Proxy WebSocket RTT', this.fields({
+      proxyRttMs: rttMs,
+      estimatedOneWayMs: estimateOneWay(rttMs),
+    }));
+  }
+
+  trackAudioSocketInputFrame(receivedAt = Date.now()) {
+    if (!this.config.latencyMonitoring) return;
+    if (this.lastInputFrameAt !== undefined) {
+      const gapMs = receivedAt - this.lastInputFrameAt;
+      this.inputFrameGaps.push(gapMs);
+      if (gapMs > 40) this.inputFrameGapsOver40Ms += 1;
+    }
+    this.lastInputFrameAt = receivedAt;
+  }
+
+  markPlaybackTurnComplete(receivedAt = Date.now()) {
+    if (!this.activePlayback) return;
+    this.activePlayback.turnCompleteAt = receivedAt;
+    if (this.playbackQueue.length === 0) this.finishPlayback('turn_complete');
+  }
+
+  finishPlayback(reason, extra = {}) {
+    const playback = this.activePlayback;
+    if (!playback) return;
+    const now = Date.now();
+    log('info', 'Bot audio playback summary', this.fields({
+      response: playback.response,
+      reason,
+      proxyMediaToAudioSocketMs: playback.firstAudioSocketWriteAt === undefined
+        ? undefined
+        : playback.firstAudioSocketWriteAt - playback.firstProxyMediaAt,
+      localPlaybackElapsedMs: playback.firstAudioSocketWriteAt === undefined
+        ? undefined
+        : now - playback.firstAudioSocketWriteAt,
+      receivedAudioMs: audioBytesDurationMs(playback.bytesReceived, 8_000),
+      writtenAudioMs: audioBytesDurationMs(playback.bytesWritten, 8_000),
+      queuePeakMs: audioBytesDurationMs(playback.queuePeakBytes, 8_000),
+      audioSocketWritablePeakBytes: playback.audioSocketWritablePeakBytes,
+      proxyRttMs: this.latestProxyRttMs,
+      estimatedProxyOneWayMs: estimateOneWay(this.latestProxyRttMs),
+      ...extra,
+    }));
+    this.activePlayback = undefined;
   }
 
   fields(extra = {}) {
@@ -475,4 +641,12 @@ function log(level, message, fields = {}) {
   const line = { timestamp: new Date().toISOString(), level, message, ...fields };
   const output = level === 'error' || level === 'warn' ? console.error : console.log;
   output(JSON.stringify(line));
+}
+
+function audioBytesDurationMs(bytes, sampleRate) {
+  return Math.round((bytes * 1000) / (2 * sampleRate));
+}
+
+function estimateOneWay(rttMs) {
+  return Number.isFinite(rttMs) ? Math.round(rttMs / 2) : undefined;
 }
