@@ -1,0 +1,18 @@
+{
+  "name": "goip-vox-websocket-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Asterisk AudioSocket to Voximplant-compatible WebSocket bridge",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "8.21.1"
+  }
+}
+

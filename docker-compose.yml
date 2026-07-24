@@ -1,0 +1,46 @@
+services:
+  bridge:
+    build:
+      context: ./bridge
+    restart: unless-stopped
+    environment:
+      AUDIO_SOCKET_HOST: 0.0.0.0
+      AUDIO_SOCKET_PORT: "9092"
+      RECORDINGS_DIR: /app/recordings
+      BRIDGE_MODE: "${BRIDGE_MODE:-record}"
+      CALL_MAX_SECONDS: "${CALL_MAX_SECONDS:-10}"
+      RECORD_CALLS: "${RECORD_CALLS:-true}"
+      PROXY_WS_URL: "${PROXY_WS_URL:-}"
+      PROXY_SHARED_TOKEN: "${PROXY_SHARED_TOKEN:-}"
+      GEMINI_MODEL: "${GEMINI_MODEL:-}"
+      SYSTEM_INSTRUCTION: "${SYSTEM_INSTRUCTION:-}"
+      INITIAL_TEXT: "${INITIAL_TEXT:-}"
+      MAX_PENDING_AUDIO_BYTES: "${MAX_PENDING_AUDIO_BYTES:-1048576}"
+      MAX_PLAYBACK_AUDIO_BYTES: "${MAX_PLAYBACK_AUDIO_BYTES:-1048576}"
+    volumes:
+      - ./recordings:/app/recordings
+    expose:
+      - "9092"
+    networks:
+      - voice
+
+  asterisk:
+    build:
+      context: ./asterisk
+    restart: unless-stopped
+    environment:
+      PUBLIC_IP: "${PUBLIC_IP:?Set PUBLIC_IP in .env}"
+      SIP_USERNAME: "${SIP_USERNAME:?Set SIP_USERNAME in .env}"
+      SIP_PASSWORD: "${SIP_PASSWORD:?Set SIP_PASSWORD in .env}"
+      LOCAL_NETWORK: "${LOCAL_NETWORK:-172.16.0.0/12}"
+    depends_on:
+      - bridge
+    ports:
+      - "5060:5060/udp"
+      - "10000-10099:10000-10099/udp"
+    networks:
+      - voice
+
+networks:
+  voice:
+    driver: bridge

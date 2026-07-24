@@ -1,0 +1,6 @@
+.env
+recordings/*.wav
+!recordings/.gitkeep
+bridge/node_modules/
+npm-debug.log*
+
