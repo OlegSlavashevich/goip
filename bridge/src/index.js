@@ -11,20 +11,21 @@ import {
   uuidBytesToString,
 } from './audio-socket.js';
 import { summarizeLatency } from './latency.js';
+import { PreparedCallRegistry } from './prepared-calls.js';
 import { createRealEstateBot } from './real-estate-bot.js';
 import { WavRecorder } from './wav.js';
 
 const config = loadConfig();
 const sessions = new Set();
+const preparedCalls = new PreparedCallRegistry({
+  ttlMs: config.preparedCallTtlMs,
+  log,
+});
 const botFetch = createCachedFetch(globalThis.fetch, { ttlMs: config.botPreloadCacheMs });
 let botPreloadedAt = 0;
 let botPreloadPromise;
 
-const server = net.createServer((socket) => {
-  const session = new CallSession(socket, config);
-  sessions.add(session);
-  session.done.finally(() => sessions.delete(session));
-});
+const server = net.createServer((socket) => acceptAudioSocket(socket));
 
 server.on('error', (error) => {
   log('error', 'AudioSocket server error', { error: error.message });
@@ -32,20 +33,32 @@ server.on('error', (error) => {
 });
 
 const readinessServer = http.createServer(async (request, response) => {
-  if (request.method !== 'GET' || !['/prepare', '/ready'].includes(request.url)) {
+  const url = new URL(request.url || '/', 'http://127.0.0.1');
+  if (request.method !== 'GET' || !['/prepare', '/ready'].includes(url.pathname)) {
     response.writeHead(404).end('not found');
     return;
   }
-  if (request.url === '/ready') {
+  if (url.pathname === '/ready') {
     const ready = isBotPreloaded();
     response.writeHead(ready ? 200 : 503).end(ready ? 'ready' : 'warming');
     return;
   }
   try {
     await ensureBotPreloaded();
+    const callId = url.searchParams.get('callId');
+    if (config.mode === 'proxy' && callId) {
+      if (!isCallId(callId)) {
+        response.writeHead(400).end('invalid callId');
+        return;
+      }
+      await prepareCallSession(callId);
+    }
     response.writeHead(200).end('ready');
   } catch (error) {
-    log('error', 'Bot preload failed', { error: error.message });
+    log('error', 'Call preparation failed', {
+      callId: url.searchParams.get('callId') || undefined,
+      error: error.message,
+    });
     response.writeHead(503).end('error');
   }
 });
@@ -79,21 +92,80 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     log('info', 'Shutting down', { signal, activeCalls: sessions.size });
     server.close();
     readinessServer.close();
+    preparedCalls.closeAll(`process_${signal.toLowerCase()}`);
     for (const session of sessions) session.close(`process_${signal.toLowerCase()}`);
     setTimeout(() => process.exit(0), 250).unref();
   });
 }
 
+function registerSession(session) {
+  if (sessions.has(session)) return session;
+  sessions.add(session);
+  session.done.finally(() => sessions.delete(session));
+  return session;
+}
+
+function prepareCallSession(callId) {
+  return preparedCalls.prepare(callId, () => registerSession(
+    new CallSession(config, { callId, preparing: true }),
+  ));
+}
+
+function acceptAudioSocket(socket) {
+  const parser = new AudioSocketParser();
+  let session;
+
+  socket.setNoDelay(true);
+  socket.on('data', (chunk) => {
+    try {
+      for (const frame of parser.push(chunk)) {
+        if (!session) {
+          if (frame.kind !== AUDIO_SOCKET_KIND.UUID) {
+            throw new Error(`First AudioSocket frame must be UUID, got ${frame.kind}`);
+          }
+          const callId = uuidBytesToString(frame.payload);
+          session = preparedCalls.claim(callId)
+            || registerSession(new CallSession(config, { callId }));
+          registerSession(session);
+          session.attachAudioSocket(socket, callId);
+          continue;
+        }
+        session.onAudioSocketFrame(frame);
+      }
+    } catch (error) {
+      log('warn', 'Invalid AudioSocket connection', {
+        callId: session?.callId,
+        error: error.message,
+      });
+      if (session) session.close('invalid_audiosocket_frame');
+      else socket.destroy();
+    }
+  });
+  socket.on('end', () => session?.close('audiosocket_end'));
+  socket.on('close', () => session?.close('audiosocket_closed'));
+  socket.on('error', (error) => {
+    log('warn', 'AudioSocket connection error', {
+      callId: session?.callId,
+      error: error.message,
+    });
+    session?.close('audiosocket_error');
+  });
+}
+
 class CallSession {
-  constructor(socket, callConfig) {
-    this.socket = socket;
+  constructor(callConfig, { callId, preparing = false } = {}) {
     this.config = callConfig;
-    this.parser = new AudioSocketParser();
-    this.callId = undefined;
+    this.socket = undefined;
+    this.callId = callId;
+    this.preparing = preparing;
+    this.audioSocketAttached = false;
+    this.audioSocketAttachedAt = undefined;
     this.recorder = undefined;
     this.ws = undefined;
     this.wsReady = false;
     this.geminiReady = false;
+    this.proxyMediaStarted = false;
+    this.initialTextSent = false;
     this.proxySetup = undefined;
     this.bot = undefined;
     this.botClient = undefined;
@@ -119,57 +191,62 @@ class CallSession {
     this.inputFrameGapsOver40Ms = 0;
     this.playbackResponseIndex = 0;
     this.activePlayback = undefined;
+    this.preparePromise = undefined;
+    this.prepareReadyPromise = undefined;
+    this.resolvePrepareReady = undefined;
+    this.rejectPrepareReady = undefined;
+    this.prepareTimeoutTimer = undefined;
     this.resolveDone = undefined;
     this.done = new Promise((resolve) => {
       this.resolveDone = resolve;
     });
-
-    socket.setNoDelay(true);
-    socket.on('data', (chunk) => this.onAudioSocketData(chunk));
-    socket.on('end', () => this.close('audiosocket_end'));
-    socket.on('close', () => this.close('audiosocket_closed'));
-    socket.on('error', (error) => {
-      log('warn', 'AudioSocket connection error', this.fields({ error: error.message }));
-      this.close('audiosocket_error');
-    });
   }
 
-  onAudioSocketData(chunk) {
-    try {
-      for (const frame of this.parser.push(chunk)) this.onAudioSocketFrame(frame);
-    } catch (error) {
-      log('warn', 'Invalid AudioSocket frame', this.fields({ error: error.message }));
-      this.close('invalid_audiosocket_frame');
+  attachAudioSocket(socket, callId) {
+    if (this.closed) throw new Error('Cannot attach AudioSocket to a closed call');
+    if (this.audioSocketAttached) throw new Error('AudioSocket is already attached');
+    if (this.callId && this.callId !== callId) {
+      throw new Error(`Prepared call ID mismatch: expected ${this.callId}, received ${callId}`);
+    }
+    this.callId = callId;
+    this.socket = socket;
+    this.audioSocketAttached = true;
+    this.audioSocketAttachedAt = Date.now();
+    socket.setNoDelay(true);
+    if (this.config.recordCalls) {
+      this.recorder = new WavRecorder({
+        directory: this.config.recordingsDir,
+        basename: this.callId,
+        sampleRate: 16_000,
+      });
+    }
+    log('info', 'Call started', this.fields({
+      preparedBeforeAnswer: this.preparing,
+      proxyReady: this.geminiReady,
+      queuedGreetingMs: audioBytesDurationMs(this.playbackBytes, 8_000),
+    }));
+    if (this.config.callMaxSeconds > 0) {
+      this.maxDurationTimer = setTimeout(
+        () => this.close('max_duration'),
+        this.config.callMaxSeconds * 1000,
+      );
+      this.maxDurationTimer.unref();
+    }
+    if (this.config.mode !== 'proxy') return;
+    this.sendProxyMediaStart();
+    this.startBotWatchdogs();
+    if (!this.ws) {
+      this.prepareProxy().catch((error) => {
+        log('error', 'Failed to prepare AI session', this.fields({ error: error.message }));
+        this.close('bot_setup_error');
+      });
     }
   }
 
   onAudioSocketFrame({ kind, payload }) {
     if (this.closed) return;
     if (kind === AUDIO_SOCKET_KIND.UUID) {
-      if (this.callId) return this.close('duplicate_uuid');
-      this.callId = uuidBytesToString(payload);
-      if (this.config.recordCalls) {
-        this.recorder = new WavRecorder({
-          directory: this.config.recordingsDir,
-          basename: this.callId,
-          sampleRate: 16_000,
-        });
-      }
-      log('info', 'Call started', this.fields());
-      if (this.config.callMaxSeconds > 0) {
-        this.maxDurationTimer = setTimeout(
-          () => this.close('max_duration'),
-          this.config.callMaxSeconds * 1000,
-        );
-        this.maxDurationTimer.unref();
-      }
-      if (this.config.mode === 'proxy') {
-        this.prepareProxy().catch((error) => {
-          log('error', 'Failed to prepare AI session', this.fields({ error: error.message }));
-          this.close('bot_setup_error');
-        });
-      }
-      return;
+      return this.close('duplicate_uuid');
     }
 
     if (kind === AUDIO_SOCKET_KIND.PCM16_8K) {
@@ -195,11 +272,38 @@ class CallSession {
     log('debug', 'Ignoring AudioSocket frame', this.fields({ kind, bytes: payload.length }));
   }
 
+  prepareBeforeAnswer() {
+    if (this.preparePromise) return this.preparePromise;
+    this.preparing = true;
+    this.prepareReadyPromise = new Promise((resolve, reject) => {
+      this.resolvePrepareReady = resolve;
+      this.rejectPrepareReady = reject;
+    });
+    this.preparePromise = (async () => {
+      const startedAt = Date.now();
+      this.prepareTimeoutTimer = setTimeout(() => {
+        this.rejectPreparedCall(new Error(
+          `AI greeting was not ready within ${this.config.prepareAiTimeoutMs}ms`,
+        ));
+      }, this.config.prepareAiTimeoutMs);
+      this.prepareTimeoutTimer.unref();
+      await this.prepareProxy();
+      await this.prepareReadyPromise;
+      log('info', 'AI call prepared before answer', this.fields({
+        prepareLatencyMs: Date.now() - startedAt,
+      }));
+    })().finally(() => {
+      if (this.prepareTimeoutTimer) clearTimeout(this.prepareTimeoutTimer);
+      this.prepareTimeoutTimer = undefined;
+    });
+    return this.preparePromise;
+  }
+
   async prepareProxy() {
+    if (this.ws || this.proxySetup) return;
     if (this.config.botProfile === 'real-estate') {
       this.bot = configuredRealEstateBot((fields) => this.fields(fields));
       this.proxySetup = await this.bot.initialize();
-      this.discardPendingAudio('bot_preload');
     } else {
       this.proxySetup = {
         model: this.config.geminiModel,
@@ -237,16 +341,7 @@ class CallSession {
         },
         metadata: { callId: this.callId, source: 'goip-audiosocket-bridge' },
       });
-      this.sendProxyPacket({
-        event: 'start',
-        sequenceNumber: this.sequenceNumber++,
-        streamId: this.callId,
-        start: {
-          streamId: this.callId,
-          mediaFormat: { encoding: 'audio/L16', sampleRate: 16_000, channels: 1 },
-          customParameters: { source: 'goip' },
-        },
-      });
+      this.sendProxyMediaStart();
       log('info', 'Proxy WebSocket connected', this.fields());
       this.startProxyLatencyMonitoring();
     });
@@ -263,6 +358,9 @@ class CallSession {
       this.wsReady = false;
       this.geminiReady = false;
       if (!this.closed) {
+        this.rejectPreparedCall(new Error(
+          `Proxy WebSocket closed before the prepared call was ready: ${code} ${reason}`,
+        ));
         log('warn', 'Proxy WebSocket closed', this.fields({
           code,
           reason: reason.toString(),
@@ -271,12 +369,39 @@ class CallSession {
       }
     });
     ws.on('error', (error) => {
+      this.rejectPreparedCall(error);
       log('warn', 'Proxy WebSocket error', this.fields({ error: error.message }));
       if (!this.closed) this.close('proxy_error');
     });
   }
 
+  sendProxyMediaStart() {
+    if (
+      this.proxyMediaStarted
+      || !this.wsReady
+      || this.ws?.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    this.proxyMediaStarted = this.sendProxyPacket({
+      event: 'start',
+      sequenceNumber: this.sequenceNumber++,
+      streamId: this.callId,
+      start: {
+        streamId: this.callId,
+        mediaFormat: { encoding: 'audio/L16', sampleRate: 16_000, channels: 1 },
+        customParameters: { source: 'goip' },
+      },
+    });
+    if (this.proxyMediaStarted) {
+      log('info', 'Proxy media stream started', this.fields({
+        beforeAnswer: !this.audioSocketAttached,
+      }));
+    }
+  }
+
   onProxyMessage(text) {
+    if (this.closed) return;
     let packet;
     try {
       packet = JSON.parse(text);
@@ -289,6 +414,9 @@ class CallSession {
       try {
         const receivedAt = Date.now();
         const pcm16k = Buffer.from(packet.media.payload, 'base64');
+        if (this.preparing && this.initialTextSent) {
+          this.resolvePreparedCall('first_audio');
+        }
         this.queuePlayback(downsample16kTo8k(pcm16k), receivedAt);
       } catch (error) {
         log('warn', 'Invalid proxy media packet', this.fields({ error: error.message }));
@@ -312,7 +440,8 @@ class CallSession {
       return;
     }
     const serverMessage = packet.serverMessage || {};
-    if (serverMessage.serverContent?.turnComplete) {
+    const serverContent = serverMessage.serverContent || {};
+    if (serverContent.turnComplete) {
       this.markPlaybackTurnComplete();
     }
     this.bot?.handleServerMessage(serverMessage, this.botClient);
@@ -320,17 +449,17 @@ class CallSession {
     const initialText = this.bot?.initialText || this.config.initialText;
     if (serverMessage.setupComplete && !this.geminiReady) {
       this.geminiReady = true;
-      this.discardPendingAudio('gemini_setup');
+      this.flushPendingAudio('gemini_setup');
       if (initialText) {
+        this.initialTextSent = true;
         this.sendProxyPacket({
           customEvent: 'gemini',
           realtimeInput: { text: initialText },
         });
+      } else {
+        this.resolvePreparedCall('gemini_setup');
       }
-      if (this.bot && !this.botStarted) {
-        this.botStarted = true;
-        this.bot.startWatchdogs(this.botClient, (reason) => this.close(reason));
-      }
+      this.startBotWatchdogs();
       log('info', 'Gemini session ready', this.fields());
     }
   }
@@ -344,15 +473,49 @@ class CallSession {
     this.pendingAudioBytes += pcm16k.length;
   }
 
-  discardPendingAudio(reason) {
+  flushPendingAudio(reason) {
     if (!this.pendingAudioBytes) return;
-    log('info', 'Discarding pre-session audio', this.fields({
-      reason,
-      bytes: this.pendingAudioBytes,
-      durationMs: Math.round(this.pendingAudioBytes / 32),
-    }));
+    const audio = this.pendingAudio;
+    const bytes = this.pendingAudioBytes;
     this.pendingAudio = [];
     this.pendingAudioBytes = 0;
+    log('info', 'Flushing pre-session audio', this.fields({
+      reason,
+      bytes,
+      durationMs: Math.round(bytes / 32),
+    }));
+    for (const pcm16k of audio) this.sendMediaPacket(pcm16k);
+  }
+
+  resolvePreparedCall(reason) {
+    if (!this.resolvePrepareReady) return;
+    const resolve = this.resolvePrepareReady;
+    this.resolvePrepareReady = undefined;
+    this.rejectPrepareReady = undefined;
+    log('info', 'Prepared greeting audio is ready', this.fields({ reason }));
+    resolve();
+  }
+
+  rejectPreparedCall(error) {
+    if (!this.rejectPrepareReady) return;
+    const reject = this.rejectPrepareReady;
+    this.resolvePrepareReady = undefined;
+    this.rejectPrepareReady = undefined;
+    reject(error);
+  }
+
+  startBotWatchdogs() {
+    if (
+      !this.audioSocketAttached
+      || !this.geminiReady
+      || !this.bot
+      || !this.botClient
+      || this.botStarted
+    ) {
+      return;
+    }
+    this.botStarted = true;
+    this.bot.startWatchdogs(this.botClient, (reason) => this.close(reason));
   }
 
   sendMediaPacket(pcm16k) {
@@ -376,6 +539,7 @@ class CallSession {
   }
 
   queuePlayback(pcm8k, receivedAt = Date.now()) {
+    if (this.closed) return;
     if (this.playbackBytes + pcm8k.length > this.config.maxPlaybackAudioBytes) {
       return this.close('playback_audio_overflow');
     }
@@ -422,7 +586,7 @@ class CallSession {
   }
 
   flushPlaybackFrame() {
-    if (this.closed || this.socket.destroyed) return;
+    if (this.closed || !this.socket || this.socket.destroyed) return;
     const frame = this.playbackQueue.shift();
     if (!frame) {
       clearInterval(this.playbackTimer);
@@ -437,6 +601,9 @@ class CallSession {
       playback.firstAudioSocketWriteAt = now;
       log('info', 'Bot audio sent to AudioSocket', this.fields({
         response: playback.response,
+        answerToFirstBotAudioMs: this.audioSocketAttachedAt === undefined
+          ? undefined
+          : now - this.audioSocketAttachedAt,
         proxyMediaToAudioSocketMs: now - playback.firstProxyMediaAt,
         queuedAudioMs: audioBytesDurationMs(this.playbackBytes + frame.length, 8_000),
         proxyRttMs: this.latestProxyRttMs,
@@ -465,6 +632,8 @@ class CallSession {
   close(reason) {
     if (this.closed) return;
     this.closed = true;
+    this.rejectPreparedCall(new Error(`Call closed before preparation completed: ${reason}`));
+    if (this.prepareTimeoutTimer) clearTimeout(this.prepareTimeoutTimer);
     if (this.maxDurationTimer) clearTimeout(this.maxDurationTimer);
     if (this.playbackTimer) clearInterval(this.playbackTimer);
     if (this.proxyPingTimer) clearInterval(this.proxyPingTimer);
@@ -474,19 +643,21 @@ class CallSession {
     this.bot?.shutdown(reason);
 
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        event: 'stop',
-        sequenceNumber: this.sequenceNumber++,
-        streamId: this.callId,
-        stop: { reason },
-      }));
+      if (this.proxyMediaStarted) {
+        this.ws.send(JSON.stringify({
+          event: 'stop',
+          sequenceNumber: this.sequenceNumber++,
+          streamId: this.callId,
+          stop: { reason },
+        }));
+      }
       this.ws.send(JSON.stringify({ customEvent: 'gemini', close: {} }));
       this.ws.close(1000, reason.slice(0, 120));
     } else {
       this.ws?.terminate();
     }
 
-    if (!this.socket.destroyed) {
+    if (this.socket && !this.socket.destroyed) {
       this.socket.end(encodeAudioSocketFrame(AUDIO_SOCKET_KIND.TERMINATE));
       setTimeout(() => {
         if (!this.socket.destroyed) this.socket.destroy();
@@ -502,13 +673,17 @@ class CallSession {
       })
       : Promise.resolve();
 
-    log('info', 'Call latency summary', this.fields({
-      proxyWebSocketRtt: summarizeLatency(this.proxyRttSamples),
-      proxyPingTimeouts: this.proxyPingTimeouts,
-      audioSocketInputFrameGap: summarizeLatency(this.inputFrameGaps),
-      audioSocketInputGapsOver40Ms: this.inputFrameGapsOver40Ms,
-    }));
-    log('info', 'Call finished', this.fields({ reason, audioDurationMs: durationMs }));
+    if (this.audioSocketAttached) {
+      log('info', 'Call latency summary', this.fields({
+        proxyWebSocketRtt: summarizeLatency(this.proxyRttSamples),
+        proxyPingTimeouts: this.proxyPingTimeouts,
+        audioSocketInputFrameGap: summarizeLatency(this.inputFrameGaps),
+        audioSocketInputGapsOver40Ms: this.inputFrameGapsOver40Ms,
+      }));
+      log('info', 'Call finished', this.fields({ reason, audioDurationMs: durationMs }));
+    } else {
+      log('info', 'Prepared call finished without answer', this.fields({ reason }));
+    }
     recorderPromise.finally(() => this.resolveDone());
   }
 
@@ -649,4 +824,8 @@ function audioBytesDurationMs(bytes, sampleRate) {
 
 function estimateOneWay(rttMs) {
   return Number.isFinite(rttMs) ? Math.round(rttMs / 2) : undefined;
+}
+
+function isCallId(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }

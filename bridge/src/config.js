@@ -54,6 +54,18 @@ export function loadConfig(env = process.env) {
       'PROXY_PING_INTERVAL_MS',
       1_000,
     ),
+    prepareAiTimeoutMs: integer(
+      env.PREPARE_AI_TIMEOUT_MS,
+      12_000,
+      'PREPARE_AI_TIMEOUT_MS',
+      1_000,
+    ),
+    preparedCallTtlMs: integer(
+      env.PREPARED_CALL_TTL_MS,
+      30_000,
+      'PREPARED_CALL_TTL_MS',
+      1_000,
+    ),
   };
 
   if (mode === 'proxy') {
