@@ -46,6 +46,11 @@ if [ ! -f "$ENV_FILE" ]; then
   exit 0
 fi
 
+if grep -q '^PUBLIC_IP=CHANGE_ME' "$ENV_FILE"; then
+  echo "Set PUBLIC_IP in $ENV_FILE before continuing." >&2
+  exit 1
+fi
+
 if grep -q '^SIP_PASSWORD=CHANGE_ME' "$ENV_FILE"; then
   echo "Set SIP_PASSWORD in $ENV_FILE before continuing." >&2
   exit 1
@@ -88,4 +93,3 @@ echo "Native GoIP bridge installed."
 echo "Check:"
 echo "  systemctl --no-pager --full status goip-ai-bridge asterisk"
 echo "  journalctl -u goip-ai-bridge -u asterisk -f"
-
