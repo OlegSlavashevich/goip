@@ -8,7 +8,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY etc/asterisk/pjsip.conf.template /opt/goip-config/pjsip.conf.template
-COPY etc/asterisk/extensions.conf /etc/asterisk/extensions.conf
+COPY etc/asterisk/extensions.conf /opt/goip-config/extensions.conf.template
 COPY etc/asterisk/rtp.conf /etc/asterisk/rtp.conf
 COPY docker-entrypoint.sh /usr/local/bin/goip-asterisk-entrypoint
 
@@ -18,4 +18,3 @@ RUN chmod 0755 /usr/local/bin/goip-asterisk-entrypoint \
 EXPOSE 5060/udp 10000-10099/udp
 
 ENTRYPOINT ["/usr/local/bin/goip-asterisk-entrypoint"]
-

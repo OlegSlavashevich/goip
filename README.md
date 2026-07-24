@@ -65,7 +65,16 @@ journalctl -u goip-ai-bridge -u asterisk -f
 asterisk -rx "pjsip show endpoint goip-trunk"
 ```
 
-Записи находятся в `/var/lib/goip-ai-bridge/recordings`.
+При `RECORD_CALLS=true` записи находятся в
+`/var/lib/goip-ai-bridge/recordings`:
+
+- `<call-uuid>.wav` — входящий голос абонента, записанный Node.js bridge;
+- `<YYYY-MM-DD_HH-MM-SS>_<call-uuid>-full.wav` — полный смешанный разговор:
+  абонент и бот.
+
+Полная запись создаётся Asterisk через `MixMonitor`, поэтому в ней слышны оба
+направления звонка. Дата и время берутся в момент поступления звонка из
+локального времени виртуалки; UUID позволяет найти тот же звонок в логах.
 
 ### Docker-вариант
 
@@ -139,6 +148,11 @@ recordings/<call-uuid>.wav
 
 Это WAV: PCM16, mono, 16 kHz — тот же входной аудиоформат, который ожидает
 `ai-websocket-proxy`.
+
+Кроме неё Asterisk сохраняет полную смешанную запись разговора в
+`recordings/full/<YYYY-MM-DD_HH-MM-SS>_<call-uuid>-full.wav`. При нативной
+установке оба файла находятся непосредственно в
+`/var/lib/goip-ai-bridge/recordings`.
 
 Полезная диагностика:
 
@@ -239,6 +253,17 @@ Asterisk выполняет `Answer()` и подключает AudioSocket. На
 ```bash
 journalctl -u goip-ai-bridge -f
 ```
+
+Записи нативной установки:
+
+```bash
+ls -lht /var/lib/goip-ai-bridge/recordings
+```
+
+Файл с суффиксом `-full.wav` содержит и голос абонента, и ответы бота. Файл без
+суффикса содержит только звук, поступивший от GoIP. Чтобы отключить обе записи,
+задайте `RECORD_CALLS=false` в `/etc/goip-ai-bridge.env` и повторно запустите
+установщик.
 
 Обновление нативной установки:
 

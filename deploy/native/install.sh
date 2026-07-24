@@ -31,8 +31,10 @@ if ! id goip-bridge >/dev/null 2>&1; then
 fi
 
 install -d -o goip-bridge -g goip-bridge -m 0750 \
-  /var/lib/goip-ai-bridge \
+  /var/lib/goip-ai-bridge
+install -d -o goip-bridge -g goip-bridge -m 2770 \
   /var/lib/goip-ai-bridge/recordings
+usermod -a -G goip-bridge asterisk
 
 if [ ! -f "$ENV_FILE" ]; then
   install -o root -g root -m 0600 \
@@ -70,15 +72,18 @@ set +a
 : "${SIP_USERNAME:?SIP_USERNAME must be set in $ENV_FILE}"
 : "${SIP_PASSWORD:?SIP_PASSWORD must be set in $ENV_FILE}"
 : "${LOCAL_NETWORK:=127.0.0.0/8}"
-export PUBLIC_IP GOIP_PUBLIC_IP SIP_USERNAME SIP_PASSWORD LOCAL_NETWORK
+: "${RECORD_CALLS:=true}"
+export PUBLIC_IP GOIP_PUBLIC_IP SIP_USERNAME SIP_PASSWORD LOCAL_NETWORK RECORD_CALLS
 
 envsubst '${PUBLIC_IP} ${GOIP_PUBLIC_IP} ${SIP_USERNAME} ${SIP_PASSWORD} ${LOCAL_NETWORK}' \
   < "$PROJECT_DIR/asterisk/etc/asterisk/pjsip.conf.template" \
   > /etc/asterisk/pjsip.conf
 
-install -o root -g asterisk -m 0640 \
-  "$PROJECT_DIR/deploy/native/extensions.conf" \
-  /etc/asterisk/extensions.conf
+envsubst '${RECORD_CALLS}' \
+  < "$PROJECT_DIR/deploy/native/extensions.conf" \
+  > /etc/asterisk/extensions.conf
+chown root:asterisk /etc/asterisk/extensions.conf
+chmod 0640 /etc/asterisk/extensions.conf
 install -o root -g asterisk -m 0640 \
   "$PROJECT_DIR/asterisk/etc/asterisk/rtp.conf" \
   /etc/asterisk/rtp.conf
