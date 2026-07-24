@@ -27,6 +27,14 @@ export function loadConfig(env = process.env) {
       'BOT_MAX_CALL_DURATION_MS',
       0,
     ),
+    botPreloadCacheMs: integer(
+      env.BOT_PRELOAD_CACHE_MS,
+      300_000,
+      'BOT_PRELOAD_CACHE_MS',
+      1_000,
+    ),
+    readinessHost: env.READINESS_HOST || '127.0.0.1',
+    readinessPort: integer(env.READINESS_PORT, 9093, 'READINESS_PORT', 1),
     maxPendingAudioBytes: integer(
       env.MAX_PENDING_AUDIO_BYTES,
       1_048_576,

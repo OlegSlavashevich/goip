@@ -165,6 +165,7 @@ BOT_PAGE_URL=https://kakdoma-sutochno.ru/assist/
 BOT_DATE_UTC_OFFSET=+03:00
 BOT_VOICE_NAME=Erinome
 BOT_MAX_CALL_DURATION_MS=1200000
+BOT_PRELOAD_CACHE_MS=300000
 ALLOW_CONFIRM_BOOKING=false
 ```
 
@@ -225,6 +226,13 @@ Node.js bridge подключается к `/v1/live` с `Authorization: Bearer 
 По умолчанию `ALLOW_CONFIRM_BOOKING=false`: диалог и заявка проходят в
 dry-run, реальный `/confirm` не вызывается. Включайте `true` только после
 проверки логов, данных брони и правовых оснований.
+
+Перед ответом на GSM-вызов Asterisk вызывает локальный
+`http://127.0.0.1:9093/prepare`. Пока bridge загружает страницу, правила и
+каталог, абонент продолжает слышать обычные гудки. После ответа `ready`
+Asterisk выполняет `Answer()` и подключает AudioSocket. Начальные данные
+кешируются на `BOT_PRELOAD_CACHE_MS` (по умолчанию пять минут), а поиски по
+конкретным датам никогда не кешируются.
 
 Логи разговора и инструментов:
 

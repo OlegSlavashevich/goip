@@ -18,7 +18,10 @@ services:
       BOT_DATE_UTC_OFFSET: "${BOT_DATE_UTC_OFFSET:-+03:00}"
       BOT_VOICE_NAME: "${BOT_VOICE_NAME:-Erinome}"
       BOT_MAX_CALL_DURATION_MS: "${BOT_MAX_CALL_DURATION_MS:-1200000}"
+      BOT_PRELOAD_CACHE_MS: "${BOT_PRELOAD_CACHE_MS:-300000}"
       ALLOW_CONFIRM_BOOKING: "${ALLOW_CONFIRM_BOOKING:-false}"
+      READINESS_HOST: "0.0.0.0"
+      READINESS_PORT: "9093"
       SYSTEM_INSTRUCTION: "${SYSTEM_INSTRUCTION:-}"
       INITIAL_TEXT: "${INITIAL_TEXT:-}"
       MAX_PENDING_AUDIO_BYTES: "${MAX_PENDING_AUDIO_BYTES:-1048576}"
@@ -27,6 +30,7 @@ services:
       - ./recordings:/app/recordings
     expose:
       - "9092"
+      - "9093"
     networks:
       - voice
 

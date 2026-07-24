@@ -1,5 +1,7 @@
+import http from 'node:http';
 import net from 'node:net';
 import { WebSocket } from 'ws';
+import { createCachedFetch } from './cached-fetch.js';
 import { loadConfig } from './config.js';
 import { downsample16kTo8k, pcmDurationMs, upsample8kTo16k } from './audio.js';
 import {
@@ -13,6 +15,9 @@ import { WavRecorder } from './wav.js';
 
 const config = loadConfig();
 const sessions = new Set();
+const botFetch = createCachedFetch(globalThis.fetch, { ttlMs: config.botPreloadCacheMs });
+let botPreloadedAt = 0;
+let botPreloadPromise;
 
 const server = net.createServer((socket) => {
   const session = new CallSession(socket, config);
@@ -23,6 +28,39 @@ const server = net.createServer((socket) => {
 server.on('error', (error) => {
   log('error', 'AudioSocket server error', { error: error.message });
   process.exitCode = 1;
+});
+
+const readinessServer = http.createServer(async (request, response) => {
+  if (request.method !== 'GET' || !['/prepare', '/ready'].includes(request.url)) {
+    response.writeHead(404).end('not found');
+    return;
+  }
+  if (request.url === '/ready') {
+    const ready = isBotPreloaded();
+    response.writeHead(ready ? 200 : 503).end(ready ? 'ready' : 'warming');
+    return;
+  }
+  try {
+    await ensureBotPreloaded();
+    response.writeHead(200).end('ready');
+  } catch (error) {
+    log('error', 'Bot preload failed', { error: error.message });
+    response.writeHead(503).end('error');
+  }
+});
+
+readinessServer.on('error', (error) => {
+  log('error', 'Readiness server error', { error: error.message });
+  process.exit(1);
+});
+
+readinessServer.listen(config.readinessPort, config.readinessHost, () => {
+  log('info', 'Readiness server listening', {
+    address: `${config.readinessHost}:${config.readinessPort}`,
+  });
+  ensureBotPreloaded().catch((error) => {
+    log('error', 'Initial bot preload failed', { error: error.message });
+  });
 });
 
 server.listen(config.port, config.host, () => {
@@ -38,6 +76,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
     log('info', 'Shutting down', { signal, activeCalls: sessions.size });
     server.close();
+    readinessServer.close();
     for (const session of sessions) session.close(`process_${signal.toLowerCase()}`);
     setTimeout(() => process.exit(0), 250).unref();
   });
@@ -52,6 +91,7 @@ class CallSession {
     this.recorder = undefined;
     this.ws = undefined;
     this.wsReady = false;
+    this.geminiReady = false;
     this.proxySetup = undefined;
     this.bot = undefined;
     this.botClient = undefined;
@@ -144,16 +184,9 @@ class CallSession {
 
   async prepareProxy() {
     if (this.config.botProfile === 'real-estate') {
-      this.bot = createRealEstateBot({
-        geminiModel: this.config.geminiModel,
-        voiceName: this.config.botVoiceName,
-        pageUrl: this.config.botPageUrl,
-        dateUtcOffset: this.config.botDateUtcOffset,
-        allowConfirmBooking: this.config.allowConfirmBooking,
-        maxCallDurationMs: this.config.botMaxCallDurationMs,
-        log: (level, message, fields) => log(level, message, this.fields(fields)),
-      });
+      this.bot = configuredRealEstateBot((fields) => this.fields(fields));
       this.proxySetup = await this.bot.initialize();
+      this.discardPendingAudio('bot_preload');
     } else {
       this.proxySetup = {
         model: this.config.geminiModel,
@@ -201,9 +234,6 @@ class CallSession {
           customParameters: { source: 'goip' },
         },
       });
-      for (const audio of this.pendingAudio) this.sendMediaPacket(audio);
-      this.pendingAudio = [];
-      this.pendingAudioBytes = 0;
       log('info', 'Proxy WebSocket connected', this.fields());
     });
 
@@ -216,6 +246,7 @@ class CallSession {
     });
     ws.on('close', (code, reason) => {
       this.wsReady = false;
+      this.geminiReady = false;
       if (!this.closed) {
         log('warn', 'Proxy WebSocket closed', this.fields({
           code,
@@ -268,11 +299,15 @@ class CallSession {
     this.bot?.handleServerMessage(serverMessage, this.botClient);
 
     const initialText = this.bot?.initialText || this.config.initialText;
-    if (serverMessage.setupComplete && initialText) {
-      this.sendProxyPacket({
-        customEvent: 'gemini',
-        realtimeInput: { text: initialText },
-      });
+    if (serverMessage.setupComplete && !this.geminiReady) {
+      this.geminiReady = true;
+      this.discardPendingAudio('gemini_setup');
+      if (initialText) {
+        this.sendProxyPacket({
+          customEvent: 'gemini',
+          realtimeInput: { text: initialText },
+        });
+      }
       if (this.bot && !this.botStarted) {
         this.botStarted = true;
         this.bot.startWatchdogs(this.botClient, (reason) => this.close(reason));
@@ -282,12 +317,23 @@ class CallSession {
   }
 
   sendOrQueueAudio(pcm16k) {
-    if (this.wsReady) return this.sendMediaPacket(pcm16k);
+    if (this.wsReady && this.geminiReady) return this.sendMediaPacket(pcm16k);
     if (this.pendingAudioBytes + pcm16k.length > this.config.maxPendingAudioBytes) {
       return this.close('pending_audio_overflow');
     }
     this.pendingAudio.push(pcm16k);
     this.pendingAudioBytes += pcm16k.length;
+  }
+
+  discardPendingAudio(reason) {
+    if (!this.pendingAudioBytes) return;
+    log('info', 'Discarding pre-session audio', this.fields({
+      reason,
+      bytes: this.pendingAudioBytes,
+      durationMs: Math.round(this.pendingAudioBytes / 32),
+    }));
+    this.pendingAudio = [];
+    this.pendingAudioBytes = 0;
   }
 
   sendMediaPacket(pcm16k) {
@@ -384,6 +430,45 @@ class CallSession {
   fields(extra = {}) {
     return { callId: this.callId, ...extra };
   }
+}
+
+function configuredRealEstateBot(fields = (extra) => extra) {
+  return createRealEstateBot({
+    geminiModel: config.geminiModel,
+    voiceName: config.botVoiceName,
+    pageUrl: config.botPageUrl,
+    dateUtcOffset: config.botDateUtcOffset,
+    allowConfirmBooking: config.allowConfirmBooking,
+    maxCallDurationMs: config.botMaxCallDurationMs,
+    fetchImpl: botFetch,
+    log: (level, message, extra) => log(level, message, fields(extra)),
+  });
+}
+
+function isBotPreloaded() {
+  if (config.mode !== 'proxy' || config.botProfile !== 'real-estate') return true;
+  return Date.now() - botPreloadedAt < config.botPreloadCacheMs;
+}
+
+async function ensureBotPreloaded() {
+  if (isBotPreloaded()) return;
+  if (botPreloadPromise) return botPreloadPromise;
+
+  botPreloadPromise = (async () => {
+    const bot = configuredRealEstateBot((fields) => ({ preload: true, ...fields }));
+    try {
+      await bot.initialize();
+      botPreloadedAt = Date.now();
+      log('info', 'Real-estate data preloaded', {
+        cacheMs: config.botPreloadCacheMs,
+      });
+    } finally {
+      bot.shutdown('preload');
+    }
+  })().finally(() => {
+    botPreloadPromise = undefined;
+  });
+  return botPreloadPromise;
 }
 
 function log(level, message, fields = {}) {
