@@ -40,7 +40,7 @@ if [ ! -f "$ENV_FILE" ]; then
     "$ENV_FILE"
   echo
   echo "Created $ENV_FILE"
-  echo "Edit SIP_PASSWORD, then run this script again:"
+  echo "Edit PUBLIC_IP, GOIP_PUBLIC_IP and SIP_PASSWORD, then run this script again:"
   echo "  nano $ENV_FILE"
   echo "  sh $PROJECT_DIR/deploy/native/install.sh $PROJECT_DIR"
   exit 0
@@ -48,6 +48,11 @@ fi
 
 if grep -q '^PUBLIC_IP=CHANGE_ME' "$ENV_FILE"; then
   echo "Set PUBLIC_IP in $ENV_FILE before continuing." >&2
+  exit 1
+fi
+
+if grep -q '^GOIP_PUBLIC_IP=CHANGE_ME' "$ENV_FILE"; then
+  echo "Set GOIP_PUBLIC_IP in $ENV_FILE before continuing." >&2
   exit 1
 fi
 
@@ -61,12 +66,13 @@ set -a
 set +a
 
 : "${PUBLIC_IP:?PUBLIC_IP must be set in $ENV_FILE}"
+: "${GOIP_PUBLIC_IP:?GOIP_PUBLIC_IP must be set in $ENV_FILE}"
 : "${SIP_USERNAME:?SIP_USERNAME must be set in $ENV_FILE}"
 : "${SIP_PASSWORD:?SIP_PASSWORD must be set in $ENV_FILE}"
 : "${LOCAL_NETWORK:=127.0.0.0/8}"
-export PUBLIC_IP SIP_USERNAME SIP_PASSWORD LOCAL_NETWORK
+export PUBLIC_IP GOIP_PUBLIC_IP SIP_USERNAME SIP_PASSWORD LOCAL_NETWORK
 
-envsubst '${PUBLIC_IP} ${SIP_USERNAME} ${SIP_PASSWORD} ${LOCAL_NETWORK}' \
+envsubst '${PUBLIC_IP} ${GOIP_PUBLIC_IP} ${SIP_USERNAME} ${SIP_PASSWORD} ${LOCAL_NETWORK}' \
   < "$PROJECT_DIR/asterisk/etc/asterisk/pjsip.conf.template" \
   > /etc/asterisk/pjsip.conf
 

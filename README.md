@@ -47,14 +47,22 @@ sh /opt/goip-ai-bridge/deploy/native/install.sh
 ```
 
 Первый запуск устанавливает Asterisk, Node.js и создаёт конфигурацию. После
-редактирования пароля второй запуск применяет PJSIP/dialplan и запускает службы.
+редактирования адресов и пароля второй запуск применяет PJSIP/dialplan и
+запускает службы. Для trunk-режима укажите:
+
+```env
+PUBLIC_IP=<публичный IPv4 виртуалки>
+GOIP_PUBLIC_IP=<публичный IPv4, с которого GoIP приходит на виртуалку>
+SIP_USERNAME=1001
+SIP_PASSWORD=<длинный случайный пароль из букв и цифр>
+```
 
 Диагностика:
 
 ```bash
 systemctl --no-pager --full status goip-ai-bridge asterisk
 journalctl -u goip-ai-bridge -u asterisk -f
-asterisk -rx "pjsip show contacts"
+asterisk -rx "pjsip show endpoint goip-trunk"
 ```
 
 Записи находятся в `/var/lib/goip-ai-bridge/recordings`.
@@ -71,6 +79,7 @@ cp .env.example .env
 
 ```env
 PUBLIC_IP=<публичный IPv4 виртуалки>
+GOIP_PUBLIC_IP=<публичный IPv4, с которого GoIP приходит на виртуалку>
 SIP_USERNAME=1001
 SIP_PASSWORD=<длинный случайный пароль из букв и цифр>
 BRIDGE_MODE=record
@@ -94,23 +103,21 @@ docker compose logs -f asterisk bridge
 Названия пунктов немного отличаются между прошивками, но в официальном
 руководстве используются следующие поля.
 
-В `Configurations → VoIP`:
+В `Configurations → Basic VoIP`:
 
-- `Config Mode`: `Single Server Mode`;
+- `Config Mode`: `Trunk Gateway Mode`;
+- `SIP Trunk Gateway1`: `<PUBLIC_IP>:5060`;
+- `SIP Trunk Gateway2` и `SIP Trunk Gateway3`: оставить пустыми;
 - `Phone Number`: `1001`;
-- `Authentication ID`: `1001`;
-- `Password`: значение `SIP_PASSWORD` из `.env`;
-- `Display Name`: `goip4`;
-- `SIP Proxy`: `<PUBLIC_IP>:5060`;
-- `SIP Registrar Server`: `<PUBLIC_IP>:5060`;
-- `Outbound Proxy`: оставить пустым;
-- `Home Domain`: `<PUBLIC_IP>`;
-- `Re-register Period`: `60`;
+- `Authentication ID` и `Password`: оставить пустыми;
+- `Re-register Period`: `0`;
+- `Prefix Match Mode`: `Match Callee`;
+- `Delete Callee Prefix while Dialing`: `Disable`;
+- `Line 1 Routing Prefix`: оставить пустым;
 - preferred codec: сначала `G.711 A-law / PCMA`, затем `G.711 μ-law / PCMU`.
 
-Сохраните настройки и перезагрузите VoIP-конфигурацию, если прошивка этого
-требует. В статусе GoIP регистрация должна стать `Y`, `Registered` или
-`LOGIN`, в зависимости от версии интерфейса.
+Сохраните настройки. В trunk-режиме SIP-регистрация не используется. Asterisk
+принимает вызовы от endpoint `goip-trunk` только с `GOIP_PUBLIC_IP`.
 
 В `Call Divert` / `Call Management`, для линии с SIM-картой:
 
@@ -118,9 +125,7 @@ docker compose logs -f asterisk bridge
 - `Forwarding to VoIP Number`: `2000`;
 - `CID Forward Mode`: `Use Remote Party ID` либо `Disabled`.
 
-Для первого теста не выбирайте `Use CID as SIP Caller ID`: некоторые прошивки
-тогда заменяют SIP username номером звонящего, и Asterisk не сможет сопоставить
-первый `INVITE` с endpoint `1001`.
+Для первого теста оставьте `CID Forward Mode` выключенным.
 
 Если включены остальные линии без SIM, отключите для них `CALL IN via GSM`.
 Номер `2000` ловится dialplan-ом Asterisk и отправляется в Node.js bridge.
@@ -138,14 +143,12 @@ recordings/<call-uuid>.wav
 Полезная диагностика:
 
 ```bash
-docker compose exec asterisk asterisk -rx "pjsip show contacts"
-docker compose exec asterisk asterisk -rx "pjsip show endpoint 1001"
+docker compose exec asterisk asterisk -rx "pjsip show endpoint goip-trunk"
 docker compose logs --tail=200 asterisk bridge
 ```
 
-Если регистрация есть, но WAV содержит тишину, почти всегда не проходит RTP.
-Проверьте UDP-порты `10000–10099`, правильность `PUBLIC_IP` и отсутствие
-SIP ALG на роутере GoIP.
+Если WAV содержит тишину, почти всегда не проходит RTP. Проверьте UDP-порты
+`10000–10099`, правильность `PUBLIC_IP` и отсутствие SIP ALG на роутере GoIP.
 
 ## 2. Подключение существующего ai-websocket-proxy
 

@@ -41,3 +41,22 @@ max_contacts=1
 remove_existing=yes
 qualify_frequency=30
 
+; Registration-free trunk mode for the GoIP gateway.
+; Only SIP received from the configured GoIP public IP reaches this endpoint.
+[goip-trunk]
+type=endpoint
+transport=transport-udp
+context=from-goip
+disallow=all
+allow=alaw
+allow=ulaw
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+dtmf_mode=rfc4733
+
+[goip-trunk-identify]
+type=identify
+endpoint=goip-trunk
+match=${GOIP_PUBLIC_IP}

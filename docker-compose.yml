@@ -30,6 +30,7 @@ services:
     restart: unless-stopped
     environment:
       PUBLIC_IP: "${PUBLIC_IP:?Set PUBLIC_IP in .env}"
+      GOIP_PUBLIC_IP: "${GOIP_PUBLIC_IP:?Set GOIP_PUBLIC_IP in .env}"
       SIP_USERNAME: "${SIP_USERNAME:?Set SIP_USERNAME in .env}"
       SIP_PASSWORD: "${SIP_PASSWORD:?Set SIP_PASSWORD in .env}"
       LOCAL_NETWORK: "${LOCAL_NETWORK:-172.16.0.0/12}"
