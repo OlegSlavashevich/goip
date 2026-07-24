@@ -35,6 +35,32 @@ Node.js принимает простой двунаправленный PCM-п�
 
 ## 1. Первый тест: запись 10 секунд
 
+### Маленькая Debian-виртуалка без Docker
+
+Если диск меньше 5 GB, используйте нативную установку. Скопируйте проект в
+`/opt/goip-ai-bridge`, затем выполните:
+
+```bash
+sh /opt/goip-ai-bridge/deploy/native/install.sh
+nano /etc/goip-ai-bridge.env
+sh /opt/goip-ai-bridge/deploy/native/install.sh
+```
+
+Первый запуск устанавливает Asterisk, Node.js и создаёт конфигурацию. После
+редактирования пароля второй запуск применяет PJSIP/dialplan и запускает службы.
+
+Диагностика:
+
+```bash
+systemctl --no-pager --full status goip-ai-bridge asterisk
+journalctl -u goip-ai-bridge -u asterisk -f
+asterisk -rx "pjsip show contacts"
+```
+
+Записи находятся в `/var/lib/goip-ai-bridge/recordings`.
+
+### Docker-вариант
+
 Создайте конфигурацию:
 
 ```bash

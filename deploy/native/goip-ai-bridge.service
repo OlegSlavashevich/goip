@@ -1,0 +1,23 @@
+[Unit]
+Description=GoIP AudioSocket to Voximplant WebSocket bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=goip-bridge
+Group=goip-bridge
+WorkingDirectory=/opt/goip-ai-bridge/bridge
+EnvironmentFile=/etc/goip-ai-bridge.env
+ExecStart=/usr/bin/node /opt/goip-ai-bridge/bridge/src/index.js
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/goip-ai-bridge
+
+[Install]
+WantedBy=multi-user.target
+

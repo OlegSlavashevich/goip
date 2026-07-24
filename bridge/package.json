@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Asterisk AudioSocket to Voximplant-compatible WebSocket bridge",
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   },
   "scripts": {
     "start": "node src/index.js",
@@ -15,4 +15,3 @@
     "ws": "8.21.1"
   }
 }
-
