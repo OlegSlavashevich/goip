@@ -43,6 +43,10 @@ test('real-estate scenario builds its prompt and four Gemini tools', async () =>
     setup.config.systemInstruction.parts[0].text,
     /Сервис «Как Дома»|сервиса "Как Дома"/,
   );
+  assert.match(
+    setup.config.systemInstruction.parts[0].text,
+    /«Тест Минск проспект Дзержинского, 84, Метро Петровщина» произноси как «Минск, проспект Дзержинского, 84, метро Петровщина»/,
+  );
   assert.ok(requestedUrls.some((url) => url.endsWith('/apartments')));
 
   const sentPackets = [];
